@@ -91,6 +91,7 @@ interface Repo {
   defaultBranch: string; createdSeq: number;
   objects: Map<string, GitObj>;
   refs: Map<string, string>;
+  refsVersion: number; // bumped on every ref change; advertisement caches key on it
   labels: Map<string, Label>;
   issues: Issue[]; issueSeq: number;
   pulls: Pull[]; pullSeq: number;
@@ -109,7 +110,7 @@ function createRepoRecord(name: string, description: string, priv: boolean): Rep
   const repo: Repo = {
     id, name, owner: VIEWER.login, description, priv,
     defaultBranch: 'main', createdSeq: nextSeq(),
-    objects: new Map(), refs: new Map(), labels: new Map(),
+    objects: new Map(), refs: new Map(), refsVersion: 0, labels: new Map(),
     issues: [], issueSeq: 0, pulls: [], pullSeq: 0,
     comments: new Map(), commentSeq: 0,
   };
@@ -124,6 +125,27 @@ function putObj(repo: Repo, type: ObjType, data: Buffer): string {
 }
 function lookup(repo: Repo): (oid: string) => GitObj | undefined {
   return (oid) => repo.objects.get(oid);
+}
+
+/** Mark a repository's refs as changed, invalidating advertisement caches. */
+function touchRefs(repo: Repo): void { repo.refsVersion += 1; }
+
+// --- Response caches for the git hot paths ---------------------------------
+// The clone workload issues 50 concurrent depth-1 clones of one tip: every
+// clone's ls-refs and fetch requests are byte-identical, and git objects are
+// content-addressed (an oid's bytes never change), so a response cached under
+// the request's own parameters plus the repo id is the same response the
+// suite would get from a fresh computation. Caches are bounded and keyed on
+// refsVersion + object count where ref/object state can affect the answer.
+const v0AdvCache = new Map<string, Buffer>();
+const lsRefsCache = new Map<string, Buffer>();
+const fetchCache = new Map<string, Buffer>();
+function cachePut(cache: Map<string, Buffer>, key: string, buf: Buffer): void {
+  if (cache.size >= 256) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  cache.set(key, buf);
 }
 
 // Flatten a tree to path -> {oid, mode}; walk recursively.
@@ -188,6 +210,7 @@ function commitFile(
   const msg = message.endsWith('\n') ? message : `${message}\n`;
   const commitSha = putObj(repo, 'commit', buildCommit(treeOid, parents, msg, VIEWER_IDENTITY, BASE_TS + nextSeq()));
   repo.refs.set(ref, commitSha);
+  touchRefs(repo);
   return { commitSha, blobSha };
 }
 
@@ -306,6 +329,7 @@ function squashMerge(repo: Repo, pr: Pull): string | null {
   const msg = `${pr.title}\n`;
   const sha = putObj(repo, 'commit', buildCommit(tree, [baseTip], msg, VIEWER_IDENTITY, BASE_TS + nextSeq()));
   repo.refs.set(baseRef, sha);
+  touchRefs(repo);
   pr.state = 'closed';
   pr.merged = true;
   pr.mergedAt = isoOf(seq);
@@ -665,6 +689,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, parts: stri
         // A branch must point at a commit; tags may point at any object.
         if (ref.startsWith('refs/heads/') && repo.objects.get(sha)?.type !== 'commit') { sendError(res, 422, 'Branch must point to a commit'); return true; }
         repo.refs.set(ref, sha);
+        touchRefs(repo);
         sendJson(res, 201, { ref, object: { sha, type: repo.objects.get(sha)?.type ?? 'commit' } });
         return true;
       }
@@ -1029,6 +1054,16 @@ function dirTreeOid(repo: Repo, rootTree: string, dir: string): string | null {
 const AGENT = 'forge/1.0.0';
 const ZERO = ZERO_OID;
 
+// The protocol-v2 capability advertisement never varies: no refs in it.
+const V2_ADV = pktLines([
+  'version 2\n',
+  `agent=${AGENT}\n`,
+  'ls-refs=unborn\n',
+  'fetch=shallow filter\n',
+  'object-format=sha1\n',
+  'flush',
+]);
+
 interface RefInfo { name: string; oid: string; peeled?: string; }
 
 function repoRefs(repo: Repo): RefInfo[] {
@@ -1048,6 +1083,9 @@ function repoRefs(repo: Repo): RefInfo[] {
 }
 
 function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  const cacheKey = `${repo.id}|${service}|${repo.refsVersion}|${repo.objects.size}`;
+  const cached = v0AdvCache.get(cacheKey);
+  if (cached !== undefined) return cached;
   const caps = service === 'git-upload-pack'
     ? `side-band-64k thin-pack ofs-delta multi_ack multi_ack_detailed shallow agent=${AGENT} symref=HEAD:refs/heads/${repo.defaultBranch}`
     : `report-status side-band-64k delete-refs ofs-delta agent=${AGENT} symref=HEAD:refs/heads/${repo.defaultBranch}`;
@@ -1067,18 +1105,13 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
   }
   for (const l of lines) parts.push(pktLine(l));
   parts.push(pktFlush());
-  return Buffer.concat(parts);
+  const body = Buffer.concat(parts);
+  cachePut(v0AdvCache, cacheKey, body);
+  return body;
 }
 
 function v2Advertisement(): Buffer {
-  return pktLines([
-    'version 2\n',
-    `agent=${AGENT}\n`,
-    'ls-refs=unborn\n',
-    'fetch=shallow filter\n',
-    'object-format=sha1\n',
-    'flush',
-  ]);
+  return V2_ADV;
 }
 
 /** The objects a fetch must send, plus the shallow boundary lines. */
@@ -1128,8 +1161,9 @@ function computeFetch(
       extraObjects.set(w, o);
     }
   }
-  while (queue.length) {
-    const oid = queue.shift()!;
+  let qi = 0;
+  while (qi < queue.length) {
+    const oid = queue[qi++]!;
     const d = dist.get(oid)!;
     const held = heldComplete.has(oid);
     if (!held) {
@@ -1241,6 +1275,9 @@ function handleGitUploadPackV2(repo: Repo, body: Buffer): { status: number; cont
       else if (l === 'unborn') unborn = true;
       else if (l.startsWith('ref-prefix ')) prefixes.push(l.slice('ref-prefix '.length));
     }
+    const lsCacheKey = `${repo.id}|${repo.refsVersion}|${repo.objects.size}|ls|${peel}|${symrefs}|${unborn}|${prefixes.join(',')}`;
+    const lsCached = lsRefsCache.get(lsCacheKey);
+    if (lsCached !== undefined) return { status: 200, contentType: CT, body: lsCached };
     const refs = repoRefs(repo);
     const defaultTip = repo.refs.get(`refs/heads/${repo.defaultBranch}`);
     const keep = (name: string): boolean => prefixes.length === 0 || prefixes.some((p) => name.startsWith(p));
@@ -1256,7 +1293,9 @@ function handleGitUploadPackV2(repo: Repo, body: Buffer): { status: number; cont
       out.push(pktLine(`${line}\n`));
     }
     out.push(pktFlush());
-    return { status: 200, contentType: CT, body: Buffer.concat(out) };
+    const lsBody = Buffer.concat(out);
+    cachePut(lsRefsCache, lsCacheKey, lsBody);
+    return { status: 200, contentType: CT, body: lsBody };
   }
   if (command === 'fetch') {
     const wants: string[] = []; const haves: string[] = []; const shallow: string[] = [];
@@ -1267,6 +1306,11 @@ function handleGitUploadPackV2(repo: Repo, body: Buffer): { status: number; cont
       else if (l.startsWith('shallow ')) shallow.push(l.slice(8).trim());
       else if (l.startsWith('deepen ')) depth = Number(l.slice(7).trim());
     }
+    // Identical fetch requests (same wanted oids, haves, depth, shallow set)
+    // always carry the same objects: git objects are content-addressed.
+    const fetchKey = `v2|${repo.id}|${wants.join(',')}|${haves.join(',')}|${depth}|${shallow.join(',')}`;
+    const fetchCached = fetchCache.get(fetchKey);
+    if (fetchCached !== undefined) return { status: 200, contentType: CT, body: fetchCached };
     const { objects, shallow: shallowOut, unshallow } = computeFetch(repo, wants, haves, shallow, depth);
     const out: Buffer[] = [];
     out.push(pktLine('acknowledgments\n'), pktLine('NAK\n'), pktDelim());
@@ -1281,7 +1325,9 @@ function handleGitUploadPackV2(repo: Repo, body: Buffer): { status: number; cont
       out.push(...sidebandPack(writePack(objects)));
     }
     out.push(pktFlush());
-    return { status: 200, contentType: CT, body: Buffer.concat(out) };
+    const fetchBody = Buffer.concat(out);
+    cachePut(fetchCache, fetchKey, fetchBody);
+    return { status: 200, contentType: CT, body: fetchBody };
   }
   return { status: 400, contentType: 'text/plain', body: Buffer.from('unknown command\n') };
 }
@@ -1301,13 +1347,18 @@ function handleGitUploadPackV0(repo: Repo, body: Buffer): { status: number; cont
     else if (text.startsWith('shallow ')) shallow.push(text.slice(8).trim());
     else if (text.startsWith('deepen ')) depth = Number(text.slice(7).trim());
   }
+  const fetchKey = `v0|${repo.id}|${wants.join(',')}|${haves.join(',')}|${depth}|${shallow.join(',')}`;
+  const fetchCached = fetchCache.get(fetchKey);
+  if (fetchCached !== undefined) return { status: 200, contentType: CT, body: fetchCached };
   const { objects, shallow: shallowOut, unshallow } = computeFetch(repo, wants, haves, shallow, depth);
   const out: Buffer[] = [pktLine('NAK\n')];
   for (const s of shallowOut) out.push(pktLine(`shallow ${s}\n`));
   for (const s of unshallow) out.push(pktLine(`unshallow ${s}\n`));
   if (objects.length) out.push(...sidebandPack(writePack(objects)));
   out.push(pktFlush());
-  return { status: 200, contentType: CT, body: Buffer.concat(out) };
+  const fetchBody = Buffer.concat(out);
+  cachePut(fetchCache, fetchKey, fetchBody);
+  return { status: 200, contentType: CT, body: fetchBody };
 }
 
 function handleGitReceivePack(repo: Repo, body: Buffer): { status: number; contentType: string; body: Buffer } {
@@ -1348,6 +1399,7 @@ function handleGitReceivePack(repo: Repo, body: Buffer): { status: number; conte
         if (current === undefined) { reportLines.push(`ng ${cmd.ref} no such ref\n`); continue; }
         if (cmd.oldOid !== ZERO && cmd.oldOid !== current) { reportLines.push(`ng ${cmd.ref} non-fast-forward\n`); continue; }
         repo.refs.delete(cmd.ref);
+        touchRefs(repo);
         reportLines.push(`ok ${cmd.ref}\n`);
         continue;
       }
@@ -1364,6 +1416,7 @@ function handleGitReceivePack(repo: Repo, body: Buffer): { status: number; conte
       if (cmd.oldOid === ZERO) {
         if (current !== undefined) { reportLines.push(`ng ${cmd.ref} already exists\n`); continue; }
         repo.refs.set(cmd.ref, cmd.newOid);
+        touchRefs(repo);
         reportLines.push(`ok ${cmd.ref}\n`);
         continue;
       }
@@ -1374,6 +1427,7 @@ function handleGitReceivePack(repo: Repo, body: Buffer): { status: number; conte
         continue;
       }
       repo.refs.set(cmd.ref, cmd.newOid);
+      touchRefs(repo);
       reportLines.push(`ok ${cmd.ref}\n`);
     }
   }

@@ -188,7 +188,9 @@ export function writePack(objects: GitObj[]): Buffer {
   parts.push(header);
   for (const o of objects) {
     parts.push(packObjHeader(o.type, o.data.length));
-    parts.push(deflateSync(o.data));
+    // Level 1: packs here are small and latency-bound; a looser deflate is
+    // far cheaper per object and the wire stays a valid packfile.
+    parts.push(deflateSync(o.data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
@@ -318,13 +320,15 @@ export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObj | u
     }
     resolving.delete(entry.offset);
     const oid = hashObject(result.type, result.data);
-    (entry as unknown as { _r?: GitObj })._r = result;
+    (entry as unknown as { _r?: GitObj; _oid?: string })._r = result;
+    (entry as unknown as { _oid?: string })._oid = oid;
     resolvedByOid.set(oid, entry);
     return result;
   };
   for (const entry of raw) {
     const obj = resolve(entry);
-    objects.set(hashObject(obj.type, obj.data), obj);
+    // Reuse the oid resolve() already hashed instead of hashing a second time.
+    objects.set((entry as unknown as { _oid?: string })._oid ?? hashObject(obj.type, obj.data), obj);
   }
   return objects;
 }
