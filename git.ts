@@ -27,10 +27,18 @@ export function parseTree(data: Buffer): TreeEntry[] {
   let off = 0;
   while (off < data.length) {
     const sp = data.indexOf(0x20, off);
+    if (sp < 0) throw new Error('malformed tree: missing mode separator');
+    const mode = data.subarray(off, sp).toString('ascii');
+    if (!/^(100644|100755|120000|40000|040000|160000)$/.test(mode)) throw new Error(`malformed tree: invalid mode ${JSON.stringify(mode)}`);
     const nul = data.indexOf(0x00, sp + 1);
+    if (nul < 0) throw new Error('malformed tree: missing name terminator');
+    if (nul + 21 > data.length) throw new Error('malformed tree: truncated oid');
+    const name = data.subarray(sp + 1, nul).toString('utf8');
+    if (name.length === 0) throw new Error('malformed tree: empty entry name');
+    if (name.includes('/')) throw new Error('malformed tree: entry name contains /');
     entries.push({
-      mode: data.subarray(off, sp).toString('ascii'),
-      name: data.subarray(sp + 1, nul).toString('utf8'),
+      mode: mode === '040000' ? '40000' : mode,
+      name,
       oid: data.subarray(nul + 1, nul + 21).toString('hex'),
     });
     off = nul + 21;
@@ -205,30 +213,39 @@ function applyDelta(base: Buffer, delta: Buffer): Buffer {
   const readSize = (): number => {
     let v = 0; let sh = 0;
     for (;;) {
+      if (off >= delta.length) throw new Error('delta truncated');
       const b = delta[off++];
       v += (b & 0x7f) * 2 ** sh; sh += 7;
       if (!(b & 0x80)) break;
+      if (sh > 56) throw new Error('delta size overflow');
     }
     return v;
   };
   const srcSize = readSize();
   const tgtSize = readSize();
   if (srcSize !== base.length) throw new Error('delta base size mismatch');
-  const out = Buffer.allocUnsafe(tgtSize);
+  if (!Number.isSafeInteger(tgtSize) || tgtSize > 512 * 1024 * 1024) throw new Error('delta target size unreasonable');
+  const out = Buffer.alloc(tgtSize);
   let written = 0;
   while (off < delta.length) {
     const op = delta[off++];
     if (op & 0x80) {
       let cpOff = 0; let cpSize = 0; let sh = 0;
-      for (let bit = 0; bit < 4; bit += 1) { if (op & (1 << bit)) cpOff += delta[off++] * 2 ** sh; sh += 8; }
+      for (let bit = 0; bit < 4; bit += 1) { if (op & (1 << bit)) { if (off >= delta.length) throw new Error('delta truncated'); cpOff += delta[off++] * 2 ** sh; } sh += 8; }
       sh = 0;
-      for (let bit = 4; bit < 7; bit += 1) { if (op & (1 << bit)) cpSize += delta[off++] * 2 ** sh; sh += 8; }
+      for (let bit = 4; bit < 7; bit += 1) { if (op & (1 << bit)) { if (off >= delta.length) throw new Error('delta truncated'); cpSize += delta[off++] * 2 ** sh; } sh += 8; }
       if (cpSize === 0) cpSize = 0x10000;
-      base.copy(out, written, cpOff, cpOff + cpSize);
+      if (cpOff > base.length || cpSize > base.length - cpOff) throw new Error('delta copy out of range');
+      if (cpSize > tgtSize - written) throw new Error('delta copy overruns target');
+      const copied = base.copy(out, written, cpOff, cpOff + cpSize);
+      if (copied !== cpSize) throw new Error('delta copy short');
       written += cpSize;
     } else if (op !== 0) {
       const lit = op & 0x7f;
-      delta.copy(out, written, off, off + lit);
+      if (lit > delta.length - off) throw new Error('delta literal truncated');
+      if (lit > tgtSize - written) throw new Error('delta literal overruns target');
+      const copied = delta.copy(out, written, off, off + lit);
+      if (copied !== lit) throw new Error('delta literal short');
       off += lit; written += lit;
     } else throw new Error('delta opcode 0');
   }
@@ -243,6 +260,10 @@ export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObj | u
   if (version !== 2 && version !== 3) throw new Error(`unsupported pack version ${version}`);
   const count = pack.readUInt32BE(8);
   const trailerStart = pack.length - 20;
+  // Verify the pack checksum before trusting any object in it.
+  const trailer = pack.subarray(trailerStart);
+  const digest = createHash('sha1').update(pack.subarray(0, trailerStart)).digest();
+  if (!digest.equals(trailer)) throw new Error('pack checksum mismatch');
   interface Raw { offset: number; typeCode: number; size: number; data: Buffer; baseOffset?: number; baseOid?: string; }
   const raw: Raw[] = [];
   const byOffset = new Map<number, Raw>();
