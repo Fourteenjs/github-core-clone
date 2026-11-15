@@ -140,12 +140,24 @@ function touchRefs(repo: Repo): void { repo.refsVersion += 1; }
 const v0AdvCache = new Map<string, Buffer>();
 const lsRefsCache = new Map<string, Buffer>();
 const fetchCache = new Map<string, Buffer>();
-function cachePut(cache: Map<string, Buffer>, key: string, buf: Buffer): void {
-  if (cache.size >= 256) {
+// Byte-budgeted put: a count cap alone does not bound memory (one cached
+// pack can be megabytes), so each cache also caps total bytes and never
+// stores a single response over 1 MiB; oversized responses are still served,
+// just recomputed. Oldest entries are evicted first.
+const cacheBytes = new Map<Map<string, Buffer>, number>();
+function cachePut(cache: Map<string, Buffer>, key: string, buf: Buffer, maxBytes: number): void {
+  if (buf.length > 1024 * 1024) return;
+  let bytes = cacheBytes.get(cache) ?? 0;
+  const prev = cache.get(key);
+  if (prev !== undefined) bytes -= prev.length;
+  while (cache.size > 0 && bytes + buf.length > maxBytes) {
     const oldest = cache.keys().next().value;
-    if (oldest !== undefined) cache.delete(oldest);
+    if (oldest === undefined) break;
+    bytes -= cache.get(oldest)!.length;
+    cache.delete(oldest);
   }
   cache.set(key, buf);
+  cacheBytes.set(cache, bytes + buf.length);
 }
 
 // Flatten a tree to path -> {oid, mode}; walk recursively.
@@ -1106,7 +1118,7 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
   for (const l of lines) parts.push(pktLine(l));
   parts.push(pktFlush());
   const body = Buffer.concat(parts);
-  cachePut(v0AdvCache, cacheKey, body);
+  cachePut(v0AdvCache, cacheKey, body, 4 * 1024 * 1024);
   return body;
 }
 
@@ -1275,7 +1287,9 @@ function handleGitUploadPackV2(repo: Repo, body: Buffer): { status: number; cont
       else if (l === 'unborn') unborn = true;
       else if (l.startsWith('ref-prefix ')) prefixes.push(l.slice('ref-prefix '.length));
     }
-    const lsCacheKey = `${repo.id}|${repo.refsVersion}|${repo.objects.size}|ls|${peel}|${symrefs}|${unborn}|${prefixes.join(',')}`;
+    // Structured key: joining prefixes with ',' is ambiguous (a comma is
+    // legal inside a ref name), so serialize the whole tuple instead.
+    const lsCacheKey = JSON.stringify([repo.id, repo.refsVersion, repo.objects.size, 'ls', peel, symrefs, unborn, prefixes]);
     const lsCached = lsRefsCache.get(lsCacheKey);
     if (lsCached !== undefined) return { status: 200, contentType: CT, body: lsCached };
     const refs = repoRefs(repo);
@@ -1294,7 +1308,7 @@ function handleGitUploadPackV2(repo: Repo, body: Buffer): { status: number; cont
     }
     out.push(pktFlush());
     const lsBody = Buffer.concat(out);
-    cachePut(lsRefsCache, lsCacheKey, lsBody);
+    cachePut(lsRefsCache, lsCacheKey, lsBody, 4 * 1024 * 1024);
     return { status: 200, contentType: CT, body: lsBody };
   }
   if (command === 'fetch') {
@@ -1308,7 +1322,11 @@ function handleGitUploadPackV2(repo: Repo, body: Buffer): { status: number; cont
     }
     // Identical fetch requests (same wanted oids, haves, depth, shallow set)
     // always carry the same objects: git objects are content-addressed.
-    const fetchKey = `v2|${repo.id}|${wants.join(',')}|${haves.join(',')}|${depth}|${shallow.join(',')}`;
+    // The key also carries objects.size: objects only ever arrive, never
+    // leave, so the same size on the same repo id means the same object set
+    // — a fetch cached while a want/have was still unknown must not be
+    // replayed after that object arrives.
+    const fetchKey = `v2|${repo.id}|${repo.objects.size}|${wants.join(',')}|${haves.join(',')}|${depth}|${shallow.join(',')}`;
     const fetchCached = fetchCache.get(fetchKey);
     if (fetchCached !== undefined) return { status: 200, contentType: CT, body: fetchCached };
     const { objects, shallow: shallowOut, unshallow } = computeFetch(repo, wants, haves, shallow, depth);
@@ -1326,7 +1344,7 @@ function handleGitUploadPackV2(repo: Repo, body: Buffer): { status: number; cont
     }
     out.push(pktFlush());
     const fetchBody = Buffer.concat(out);
-    cachePut(fetchCache, fetchKey, fetchBody);
+    cachePut(fetchCache, fetchKey, fetchBody, 32 * 1024 * 1024);
     return { status: 200, contentType: CT, body: fetchBody };
   }
   return { status: 400, contentType: 'text/plain', body: Buffer.from('unknown command\n') };
@@ -1347,7 +1365,7 @@ function handleGitUploadPackV0(repo: Repo, body: Buffer): { status: number; cont
     else if (text.startsWith('shallow ')) shallow.push(text.slice(8).trim());
     else if (text.startsWith('deepen ')) depth = Number(text.slice(7).trim());
   }
-  const fetchKey = `v0|${repo.id}|${wants.join(',')}|${haves.join(',')}|${depth}|${shallow.join(',')}`;
+  const fetchKey = `v0|${repo.id}|${repo.objects.size}|${wants.join(',')}|${haves.join(',')}|${depth}|${shallow.join(',')}`;
   const fetchCached = fetchCache.get(fetchKey);
   if (fetchCached !== undefined) return { status: 200, contentType: CT, body: fetchCached };
   const { objects, shallow: shallowOut, unshallow } = computeFetch(repo, wants, haves, shallow, depth);
@@ -1357,7 +1375,7 @@ function handleGitUploadPackV0(repo: Repo, body: Buffer): { status: number; cont
   if (objects.length) out.push(...sidebandPack(writePack(objects)));
   out.push(pktFlush());
   const fetchBody = Buffer.concat(out);
-  cachePut(fetchCache, fetchKey, fetchBody);
+  cachePut(fetchCache, fetchKey, fetchBody, 32 * 1024 * 1024);
   return { status: 200, contentType: CT, body: fetchBody };
 }
 
