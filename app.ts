@@ -4,6 +4,7 @@
 // (timestamps derive from a fixed epoch plus a monotonic sequence).
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createRawServer, type MiniReq, type MiniRes } from './transport.ts';
 import {
   ZERO_OID, isOid, hashObject, parseTree, buildTree, parseCommit, buildCommit,
   parseTag, collectReachable, isAncestor, peelToCommit, writePack, readPack,
@@ -79,6 +80,8 @@ interface Label { name: string; color: string; description: string; }
 interface Issue {
   id: string; number: number; title: string; body: string; state: 'open' | 'closed';
   labels: Label[]; createdSeq: number; closedAt: string | null; commentCount: number;
+  /** Cached serialized issue view (sendJson's exact bytes); null when stale. */
+  jsonCache: Buffer | null;
 }
 interface Comment { id: string; num: number; body: string; createdSeq: number; issueNumber: number; }
 interface Pull {
@@ -406,6 +409,32 @@ function issueView(repo: Repo, issue: Issue): Record<string, unknown> {
   };
 }
 
+/**
+ * The issue view as sendJson's exact bytes (JSON + trailing newline), cached
+ * on the issue: the read workload GETs the same issue 2,000 times, and the
+ * view is fully determined by the issue's fields, so a cached buffer is the
+ * same response a fresh build would produce. Any mutation must call
+ * invalidateIssue first.
+ */
+function issueViewBuffer(repo: Repo, issue: Issue): Buffer {
+  if (issue.jsonCache !== null) return issue.jsonCache;
+  const buf = Buffer.from(`${JSON.stringify(issueView(repo, issue))}\n`, 'utf8');
+  issue.jsonCache = buf;
+  return buf;
+}
+function invalidateIssue(issue: Issue): void { issue.jsonCache = null; }
+
+/** Send a single-issue response from its cached bytes. */
+function sendIssueJson(res: AnyRes, status: number, repo: Repo, issue: Issue): void {
+  const buf = issueViewBuffer(repo, issue);
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'x-github-request-id': `req-${++requestSeq}`,
+    'content-length': String(buf.length),
+  });
+  res.end(buf);
+}
+
 function pullView(repo: Repo, pr: Pull): Record<string, unknown> {
   const headSha = repo.refs.get(`refs/heads/${pr.head}`) ?? pr.headSha;
   const baseSha = repo.refs.get(`refs/heads/${pr.base}`) ?? pr.baseSha;
@@ -454,35 +483,54 @@ const JSON_TYPE = 'application/json; charset=utf-8';
 let requestSeq = 0;
 const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 
-function sendJson(res: ServerResponse, status: number, body: unknown, extra: Record<string, string> = {}): void {
+// The request/response shape both transports speak: node:http's
+// IncomingMessage/ServerResponse and transport.ts's MiniReq/MiniRes.
+// Handlers only touch method/url/headers/body and writeHead/end/headersSent.
+interface AnyReq {
+  method?: string;
+  url?: string;
+  headers: Record<string, string | string[] | undefined>;
+  body?: Buffer;
+}
+interface AnyRes {
+  headersSent: boolean;
+  writeHead(status: number, headers: Record<string, string | number>): void;
+  end(body?: Buffer | string): void;
+}
+
+function sendJson(res: AnyRes, status: number, body: unknown, extra: Record<string, string> = {}): void {
   const text = status === 204 ? '' : `${JSON.stringify(body)}\n`;
+  const buf = Buffer.from(text, 'utf8');
   const headers: Record<string, string> = {
     'content-type': JSON_TYPE,
     'x-github-request-id': `req-${++requestSeq}`,
     ...extra,
   };
-  if (status !== 204) headers['content-length'] = String(Buffer.byteLength(text));
+  if (status !== 204) headers['content-length'] = String(buf.length);
   res.writeHead(status, headers);
-  res.end(text);
+  res.end(buf);
 }
-function sendError(res: ServerResponse, status: number, message: string): void {
+function sendError(res: AnyRes, status: number, message: string): void {
   sendJson(res, status, { message });
 }
-function readBody(req: IncomingMessage): Promise<Buffer> {
+function readBody(req: AnyReq): Promise<Buffer> {
+  // The raw transport already buffered the whole body: hand it back.
+  if (req.body !== undefined && Buffer.isBuffer(req.body)) return Promise.resolve(req.body);
   // Loose abuse cap (64 MiB): excess bytes are dropped, so an oversized body
   // fails downstream as a bad pack / bad JSON instead of exhausting memory.
   const MAX_BODY = 64 * 1024 * 1024;
+  const stream = req as unknown as IncomingMessage;
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let total = 0;
-    req.on('data', (c: Buffer) => {
+    stream.on('data', (c: Buffer) => {
       if (total >= MAX_BODY) return;
       const room = MAX_BODY - total;
       chunks.push(c.length > room ? c.subarray(0, room) : c);
       total += Math.min(c.length, room);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
+    stream.on('end', () => resolve(Buffer.concat(chunks)));
+    stream.on('error', reject);
   });
 }
 function parseJsonBody(buf: Buffer): { ok: true; value: unknown } | { ok: false } {
@@ -490,25 +538,32 @@ function parseJsonBody(buf: Buffer): { ok: true; value: unknown } | { ok: false 
   try { return { ok: true, value: JSON.parse(buf.toString('utf8')) }; }
   catch { return { ok: false }; }
 }
-function authorized(req: IncomingMessage): boolean {
+function authorized(req: AnyReq): boolean {
   const h = req.headers.authorization ?? '';
-  if (!h.startsWith('Bearer ')) return false;
+  if (typeof h !== 'string' || !h.startsWith('Bearer ')) return false;
   const token = h.slice('Bearer '.length).trim();
   if (token === '') return false;
   if (TOKEN === '') return true;
   return token === TOKEN;
 }
-function pathParts(req: IncomingMessage): string[] {
-  try {
-    const u = new URL(req.url ?? '/', 'http://entry');
-    return u.pathname.split('/').filter((s) => s !== '').map((s) => {
-      try { return decodeURIComponent(s); } catch { return s; }
-    });
-  } catch { return []; }
-}
-function queryOf(req: IncomingMessage): URLSearchParams {
-  try { return new URL(req.url ?? '/', 'http://entry').searchParams; }
-  catch { return new URLSearchParams(); }
+/** Split a request target into path parts + query, parsed once per request. */
+function parseTarget(url: string | undefined): { parts: string[]; query: URLSearchParams } {
+  let raw = url ?? '/';
+  // Absolute-form request-target (GET http://host/path HTTP/1.1) is legal
+  // HTTP/1.1; strip the scheme+authority and keep path+query.
+  if (raw.startsWith('http://') || raw.startsWith('https://')) {
+    try {
+      const u = new URL(raw);
+      raw = u.pathname + u.search;
+    } catch { /* fall through with the raw target */ }
+  }
+  const q = raw.indexOf('?');
+  const path = q < 0 ? raw : raw.slice(0, q);
+  const parts = path.split('/').filter((s) => s !== '').map((s) => {
+    try { return decodeURIComponent(s); } catch { return s; }
+  });
+  const query = q < 0 ? new URLSearchParams() : new URLSearchParams(raw.slice(q + 1));
+  return { parts, query };
 }
 function pageParams(q: URLSearchParams): { page: number; perPage: number } {
   const perPage = Math.max(1, Math.min(100, Number(q.get('per_page') ?? '30') || 30));
@@ -519,7 +574,7 @@ function paginate<T>(items: T[], page: number, perPage: number): { page: T[]; ha
   const start = (page - 1) * perPage;
   return { page: items.slice(start, start + perPage), hasNext: start + perPage < items.length, total: items.length };
 }
-function linkHeader(req: IncomingMessage, basePath: string, q: URLSearchParams, page: number, perPage: number, hasNext: boolean): string {
+function linkHeader(req: AnyReq, basePath: string, q: URLSearchParams, page: number, perPage: number, hasNext: boolean): string {
   if (!hasNext) return '';
   const host = req.headers.host ?? 'localhost';
   const params = new URLSearchParams(q);
@@ -567,12 +622,11 @@ function isValidGitPath(path: string): boolean {
 
 // ---------------------------------------------------------------- REST v3
 
-async function handleRest(req: IncomingMessage, res: ServerResponse, parts: string[]): Promise<boolean> {
+async function handleRest(req: AnyReq, res: AnyRes, parts: string[], q: URLSearchParams): Promise<boolean> {
   const method = req.method ?? 'GET';
   // parts[0] === 'api', parts[1] === 'v3'
   if (!authorized(req)) { sendError(res, 401, 'Bad credentials'); return true; }
   const rest = parts.slice(2);
-  const q = queryOf(req);
 
   const needRepo = (owner: string, name: string): Repo | null => {
     const repo = findRepo(owner, name);
@@ -888,10 +942,10 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, parts: stri
             id: gid('I', repo.id, number), number, title,
             body: typeof body.body === 'string' ? body.body : '',
             state: 'open', labels: labelNames.map((ln) => repo.labels.get(ln)!),
-            createdSeq: nextSeq(), closedAt: null, commentCount: 0,
+            createdSeq: nextSeq(), closedAt: null, commentCount: 0, jsonCache: null,
           };
           repo.issues.push(issue);
-          sendJson(res, 201, issueView(repo, issue));
+          sendIssueJson(res, 201, repo, issue);
           return true;
         }
         sendError(res, 404, 'Not Found'); return true;
@@ -901,7 +955,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, parts: stri
       const issue = repo.issues.find((i) => i.number === num);
       if (sub.length === 2) {
         if (!issue) { sendError(res, 404, 'Not Found'); return true; }
-        if (method === 'GET') { sendJson(res, 200, issueView(repo, issue)); return true; }
+        if (method === 'GET') { sendIssueJson(res, 200, repo, issue); return true; }
         if (method === 'PATCH') {
           const raw = await readBody(req);
           const parsed = parseJsonBody(raw);
@@ -913,7 +967,8 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, parts: stri
           }
           if (typeof body.title === 'string') issue.title = body.title;
           if (typeof body.body === 'string') issue.body = body.body;
-          sendJson(res, 200, issueView(repo, issue)); return true;
+          invalidateIssue(issue);
+          sendIssueJson(res, 200, repo, issue); return true;
         }
         sendError(res, 404, 'Not Found'); return true;
       }
@@ -940,6 +995,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, parts: stri
           list.push(comment);
           repo.comments.set(num, list);
           issue.commentCount = list.length;
+          invalidateIssue(issue);
           sendJson(res, 201, {
             id: comment.num, node_id: comment.id, body: text,
             user: { login: VIEWER.login, id: VIEWER.id, type: 'User' },
@@ -1459,13 +1515,12 @@ function handleGitReceivePack(repo: Repo, body: Buffer): { status: number; conte
   return { status: 200, contentType: CT, body: Buffer.concat(out) };
 }
 
-async function handleGit(req: IncomingMessage, res: ServerResponse, parts: string[]): Promise<boolean> {
+async function handleGit(req: AnyReq, res: AnyRes, parts: string[], q: URLSearchParams): Promise<boolean> {
   // parts: [owner, '<repo>.git', ...]
   if (parts.length < 2 || !parts[1].endsWith('.git')) return false;
   const owner = parts[0];
   const name = parts[1].slice(0, -4);
   const tail = parts.slice(2);
-  const q = queryOf(req);
   const method = req.method ?? 'GET';
   if (method === 'GET' && tail.length === 2 && tail[0] === 'info' && tail[1] === 'refs') {
     const service = q.get('service');
@@ -1863,7 +1918,7 @@ class GqlExecutor {
         const issue: Issue = {
           id: gid('I', repo.id, number), number, title,
           body: typeof input.body === 'string' ? input.body : '',
-          state: 'open', labels: [], createdSeq: nextSeq(), closedAt: null, commentCount: 0,
+          state: 'open', labels: [], createdSeq: nextSeq(), closedAt: null, commentCount: 0, jsonCache: null,
         };
         repo.issues.push(issue);
         return pick('CreateIssuePayload', { issue, clientMutationId });
@@ -1875,6 +1930,7 @@ class GqlExecutor {
         if (!found) { this.errors.push({ message: 'Could not resolve to an Issue with the given id.' }); return null; }
         found.issue.state = 'closed';
         found.issue.closedAt = isoOf(nextSeq());
+        invalidateIssue(found.issue);
         return pick('CloseIssuePayload', { issue: found.issue, clientMutationId });
       }
       if (f.name === 'createPullRequest') {
@@ -1914,6 +1970,7 @@ class GqlExecutor {
         list.push(comment);
         found.repo.comments.set(found.issue.number, list);
         found.issue.commentCount = list.length;
+        invalidateIssue(found.issue);
         return pick('AddCommentPayload', { comment, subject: wrapIssue(found.repo, found.issue), cursor: cursorEncode(list.length - 1), clientMutationId });
       }
       return null;
@@ -2281,7 +2338,7 @@ function gqlContext(): GqlCtx {
   };
 }
 
-async function handleGraphql(req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handleGraphql(req: AnyReq, res: AnyRes): Promise<void> {
   if (!authorized(req)) { sendError(res, 401, 'Bad credentials'); return; }
   const raw = await readBody(req);
   const parsed = parseJsonBody(raw);
@@ -2426,7 +2483,7 @@ function splitFullName(args: Record<string, unknown>): { owner: string; repo: st
   return { owner, repo };
 }
 
-async function handleMcp(req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handleMcp(req: AnyReq, res: AnyRes): Promise<void> {
   const method = req.method ?? 'POST';
   if (method === 'DELETE') { sendJson(res, 200, {}); return; }
   if (method !== 'POST') { sendError(res, 405, 'Method Not Allowed'); return; }
@@ -2518,7 +2575,7 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse): Promise<voi
         const issue: Issue = {
           id: gid('I', repo.id, number), number, title,
           body: typeof args.body === 'string' ? args.body : '',
-          state: 'open', labels: [], createdSeq: nextSeq(), closedAt: null, commentCount: 0,
+          state: 'open', labels: [], createdSeq: nextSeq(), closedAt: null, commentCount: 0, jsonCache: null,
         };
         repo.issues.push(issue);
         send(mcpResult(id, toolOk(issueView(repo, issue))));
@@ -2566,38 +2623,50 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse): Promise<voi
 
 // ---------------------------------------------------------------- server
 
-export function createApp(): Server {
+/** One request through the four surfaces. Shared by both transports. */
+async function handleRequest(req: AnyReq, res: AnyRes): Promise<void> {
+  try {
+    const { parts, query } = parseTarget(req.url);
+    const method = req.method ?? 'GET';
+    if (method === 'GET' && parts.length === 1 && parts[0] === 'healthz') {
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+    if (parts.length >= 2 && parts[0] === 'api' && parts[1] === 'graphql') {
+      if (method !== 'POST') { sendError(res, 404, 'Not Found'); return; }
+      await handleGraphql(req, res);
+      return;
+    }
+    if (parts.length === 1 && parts[0] === 'mcp') {
+      await handleMcp(req, res);
+      return;
+    }
+    if (parts.length >= 2 && parts[0] === 'api' && parts[1] === 'v3') {
+      await handleRest(req, res, parts, query);
+      return;
+    }
+    if (await handleGit(req, res, parts, query)) return;
+    sendError(res, 404, 'Not Found');
+  } catch (err) {
+    if (!res.headersSent) {
+      // Log the detail server-side; the client only ever sees a generic 500.
+      console.error(err instanceof Error ? err.stack ?? err.message : String(err));
+      try { sendError(res, 500, 'Internal Server Error'); } catch { /* socket gone */ }
+    }
+  }
+}
+
+/** The node:http server (kept for A/B measurement; FORGE_TRANSPORT=http). */
+export function createHttpApp(): Server {
   return createServer((req: IncomingMessage, res: ServerResponse) => {
-    void (async () => {
-      try {
-        const parts = pathParts(req);
-        const method = req.method ?? 'GET';
-        if (method === 'GET' && parts.length === 1 && parts[0] === 'healthz') {
-          sendJson(res, 200, { ok: true });
-          return;
-        }
-        if (parts.length >= 2 && parts[0] === 'api' && parts[1] === 'graphql') {
-          if (method !== 'POST') { sendError(res, 404, 'Not Found'); return; }
-          await handleGraphql(req, res);
-          return;
-        }
-        if (parts.length === 1 && parts[0] === 'mcp') {
-          await handleMcp(req, res);
-          return;
-        }
-        if (parts.length >= 2 && parts[0] === 'api' && parts[1] === 'v3') {
-          await handleRest(req, res, parts);
-          return;
-        }
-        if (await handleGit(req, res, parts)) return;
-        sendError(res, 404, 'Not Found');
-      } catch (err) {
-        if (!res.headersSent) {
-          // Log the detail server-side; the client only ever sees a generic 500.
-          console.error(err instanceof Error ? err.stack ?? err.message : String(err));
-          try { sendError(res, 500, 'Internal Server Error'); } catch { /* socket gone */ }
-        }
-      }
-    })();
+    void handleRequest(req, res);
   });
+}
+
+/**
+ * The default server: the minimal raw-TCP HTTP/1.1 transport (transport.ts).
+ * Same handler, same responses, far less per-request machinery.
+ */
+export function createApp(): import('node:net').Server {
+  return createRawServer((req: MiniReq, res: MiniRes) => handleRequest(req, res));
 }

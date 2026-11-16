@@ -14,8 +14,7 @@
 // Nothing here touches the forge itself: all request handling lives in
 // app.ts, and this file only wires the process up to the harness.
 
-import { createApp as buildForge } from './app.ts';
-import type { Server } from 'node:http';
+import { createApp as buildForge, createHttpApp as buildHttpForge } from './app.ts';
 
 // Read the environment origin, dropping any trailing slashes.
 const envOrigin = (): string => {
@@ -109,15 +108,17 @@ const awaitTrialEnd = async (): Promise<void> => {
 };
 
 // The ephemeral TCP port the forge bound, or fail when it bound none.
-const boundPortOf = (forge: Server): number => {
+const boundPortOf = (forge: { address(): unknown }): number => {
     const bound = forge.address();
-    if (bound !== null && typeof bound !== 'string') return bound.port;
+    if (bound !== null && typeof bound === 'object' && 'port' in bound) return (bound as { port: number }).port;
     throw new Error('the forge did not bind an ephemeral TCP port');
 };
 
 // Bring the forge up, announce it, and stay alive until the trial ends.
+// FORGE_TRANSPORT=http selects the node:http server (A/B measurement only);
+// the default is the raw-TCP transport in transport.ts.
 const run = async (): Promise<void> => {
-    const forge = buildForge();
+    const forge = process.env.FORGE_TRANSPORT === 'http' ? buildHttpForge() : buildForge();
     await new Promise<void>((ready, failed) => {
         forge.once('error', failed);
         forge.listen(0, () => ready());
